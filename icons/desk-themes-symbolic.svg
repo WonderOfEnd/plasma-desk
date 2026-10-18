@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Theme switcher: two cards with a sparkle -->
+  <rect x="1.5" y="4.5" width="9" height="9" rx="2" fill="none" stroke="#ffffff" stroke-width="1.2"/>
+  <path d="M5.5 2.5 h7 a2 2 0 0 1 2 2 v7" fill="none" stroke="#ffffff" stroke-width="1.2" stroke-linecap="round"/>
+  <path d="M6 6.8 l0.7 1.6 1.6 0.7 -1.6 0.7 -0.7 1.6 -0.7 -1.6 -1.6 -0.7 1.6 -0.7z" fill="#ffffff"/>
+</svg>

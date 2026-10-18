@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Desktop Themes
+Name[ru]=Темы рабочего стола
+Comment=Save and switch whole Plasma workspaces: panels, widgets, wallpapers, colors
+Comment[ru]=Сохранение и переключение рабочих пространств: панели, виджеты, обои, цвета
+Exec=@BINDIR@/desk gui
+Icon=preferences-desktop-theme-global
+Terminal=false
+Categories=Settings;DesktopSettings;
+Keywords=theme;layout;workspace;panel;wallpaper;widgets;тема;обои;виджеты;

@@ -1,0 +1,17 @@
+{
+    "KPlugin": {
+        "Id": "local.desk.switcher",
+        "Name": "Desktop Themes",
+        "Name[ru]": "Темы рабочего стола",
+        "Description": "Switch desk workspace themes with one click",
+        "Description[ru]": "Переключение тем desk в один клик",
+        "Category": "Windows and Tasks",
+        "Icon": "desk-themes-symbolic",
+        "Version": "1.0",
+        "License": "GPL-3.0",
+        "Website": "https://github.com/WonderOfEnd/plasma-desk",
+        "Authors": [{ "Name": "WonderOfEnd" }]
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

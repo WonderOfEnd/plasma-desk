@@ -1,0 +1,888 @@
+#!/usr/bin/python3 -I
+"""desk — save and switch whole KDE Plasma 6 workspaces: panels, widgets, wallpapers,
+colors, icons, fonts, window decorations, lock screen.
+
+A theme is a snapshot of "look" settings only. Shortcuts, mouse, monitors, tiling and
+application settings are not part of a theme and never change on a switch.
+
+    desk                  picker window (kdialog)
+    desk list             list themes
+    desk save NAME        save the current desktop as a theme (or overwrite it)
+    desk apply NAME       switch to a theme
+    desk rm NAME          delete a theme
+    desk mv OLD NEW       rename a theme
+    desk clean            reset to the stock Plasma layout to build a new theme
+    desk restore          go back to the state before the last switch
+    desk json             themes as JSON (used by the panel switcher)
+    desk preview [NAME…]  regenerate preview images
+
+Themes live in ~/.local/share/desk-themes/<name>/config/ — whole files and parts of files
+from ~/.config. Wallpapers they reference are copied into the shared
+~/.local/share/desk-themes/.assets/ (identical files are stored once) and the theme
+points there, so a theme keeps working when the original file is moved or deleted.
+
+Settings (optional), ~/.config/deskrc:
+    [General]
+    Language=ru          interface language: en or ru (default: from the locale)
+    PreviewScreen=0      Plasma screen whose wallpaper becomes the theme preview
+"""
+
+import glob
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.parse import quote, unquote
+
+HOME = Path.home()
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+SHARE = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
+ROOT = SHARE / "desk-themes"
+BACKUPS = ROOT / ".backups"
+CURRENT = ROOT / ".current"
+ASSETS = ROOT / ".assets"
+LOG = ROOT / ".last-error.log"
+KEEP_BACKUPS = 5
+
+# Files a theme takes whole. If a theme has no copy of a file, the live one is left alone
+# (unless the theme lists it in .absent, see below).
+WHOLE = [
+    "plasma-org.kde.plasma.desktop-appletsrc",   # desktops, panels, widgets, wallpapers
+    "plasmashellrc",                             # panel sizes and behaviour
+    "plasmarc",                                  # Plasma style
+    "ksplashrc",                                 # splash screen
+    "breezerc", "auroraerc", "klassy/klassyrc", "lightlyrc", "darklyrc",  # window decorations
+    "Kvantum/kvantum.kvconfig",                  # selected Kvantum theme (the themes themselves are not touched)
+]
+
+# Directories a theme takes whole and replaces completely on apply.
+# kdedefaults is the "defaults" layer a global theme writes (Plasma style, decoration,
+# splash, cursor, colors); Plasma puts it into XDG_CONFIG_DIRS before /etc/xdg. Without it
+# the global theme of one desk theme shows through another.
+WHOLE_DIRS = ["kdedefaults"]
+
+# Directories under ~/.local/share a theme carries along (symlinks kept as is). A user copy
+# of the desktop shell: kscreenlocker takes the lock screen from the shell package, so a
+# custom lock screen is a copy of the shell with its lockscreen folder replaced. A theme
+# without it removes such a copy on apply.
+DATA_DIRS = ["plasma/shells/org.kde.plasma.desktop"]
+ABSENT_DATA = ".absent-data"
+
+# WHOLE files that did not exist when the theme was saved: they are deleted on apply so a
+# file created by another theme does not override this one.
+ABSENT = ".absent"
+
+# Theme decoration files in the theme directory (for the switcher); snapshots keep them.
+KEEP_FILES = ["icon.svg", "preview.jpg"]
+
+# Files a theme takes only partly: whole groups (exact name or prefix) and single keys in a
+# group. Everything else in these files is left alone on a switch.
+PARTIAL = {
+    "kdeglobals": [
+        ("prefix", "Colors:"), ("prefix", "ColorEffects:"), ("group", "WM"), ("group", "Icons"),
+        ("keys", "General", ["ColorScheme", "ColorSchemeHash", "AccentColor",
+                             "LastUsedCustomAccentColor", "accentColorFromWallpaper",
+                             "font", "fixed", "menuFont", "smallestReadableFont",
+                             "toolBarFont", "taskbarFont", "activeFont",
+                             "XftAntialias", "XftHintStyle", "XftSubPixel"]),
+        ("keys", "KDE", ["LookAndFeelPackage", "widgetStyle", "contrast", "frameContrast",
+                         "ShowIconsInMenuItems", "ShowIconsOnPushButtons"]),
+    ],
+    "kwinrc": [
+        ("group", "org.kde.kdecoration2"), ("group", "Plugins"), ("prefix", "Effect-"),
+        ("group", "TabBox"), ("group", "TabBoxAlternative"),     # Alt+Tab switcher look
+    ],
+    "kscreenlockerrc": [("prefix", "Greeter")],
+    "kcminputrc": [("keys", "Mouse", ["cursorTheme", "cursorSize"])],
+    "kxkbrc": [("keys", "Layout", ["DisplayNames"])],           # keyboard layout labels in the tray
+    "mimeapps.list": [("keys", "Default Applications", ["inode/directory"])],  # file manager
+    "krunnerrc": [("keys", "General", ["FreeFloating"])],      # KRunner at the top or centered
+}
+
+MEDIA = r"(?:jpe?g|png|webp|gif|svg|bmp|avif|jxl|mp4|webm|mkv|mov|avi|m4v)"
+PATH_RE = re.compile(r"(?:file://)?(/[^\n\"',;]+?\." + MEDIA + r")(?=$|[\n\"',;])", re.I)
+
+
+# ── Settings and language ──────────────────────────────────────────────────────
+
+def setting(key, default=""):
+    """A key from [General] of ~/.config/deskrc."""
+    try:
+        text = (CONFIG / "deskrc").read_text(errors="replace")
+    except OSError:
+        return default
+    for name, lines in parse_ini(text):
+        if name == "General":
+            for line in lines:
+                if key_of(line) == key:
+                    return line.split("=", 1)[1].strip()
+    return default
+
+
+def language():
+    lang = setting("Language")
+    if not lang:
+        for var in ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"):
+            if os.environ.get(var):
+                lang = os.environ[var]
+                break
+    return "ru" if lang.lower().startswith("ru") else "en"
+
+
+RU = {
+    "Desktop Themes": "Темы рабочего стола",
+    "Invalid theme name: “{}”": "Недопустимое имя темы: «{}»",
+    "widget {}": "виджет {}",
+    "wallpaper plugin {}": "плагин обоев {}",
+    "icons {}": "иконки {}",
+    "No themes yet. Save the current desktop: desk save NAME":
+        "Тем пока нет. Сохранить текущую: desk save ИМЯ",
+    "Theme “{}” saved: {}": "Тема «{}» сохранена: {}",
+    "No theme “{}”. Available: {}": "Темы «{}» нет. Есть: {}",
+    "nothing": "ничего",
+    "⚠ not installed: {}": "⚠ не установлено: {}",
+    "Theme “{}” applied. Previous state: {}": "Тема «{}» применена. Прежнее состояние: {}",
+    "No theme “{}”": "Темы «{}» нет",
+    "Theme “{}” deleted": "Тема «{}» удалена",
+    "Theme “{}” already exists": "Тема «{}» уже есть",
+    "plasma-apply-lookandfeel failed": "plasma-apply-lookandfeel не сработал",
+    "Layout reset to stock ({}). Previous state: {}\nBuild a new desktop and save it: desk save NAME":
+        "Раскладка сброшена к стандартной ({}). Прежнее состояние: {}\n"
+        "Собери новый рабочий стол и сохрани: desk save ИМЯ",
+    "No backups": "Резервных копий нет",
+    "Restored the state from {}": "Восстановлено состояние от {}",
+    "Save the current desktop as a new theme…": "Сохранить текущий рабочий стол как новую тему…",
+    "Overwrite theme “{}” with the current state": "Перезаписать тему «{}» текущим состоянием",
+    "Start a new theme from a clean desktop": "Начать новую тему с чистого рабочего стола",
+    "Go back to the state before the last switch": "Вернуть состояние до последнего переключения",
+    "Rename a theme…": "Переименовать тему…",
+    "Delete a theme…": "Удалить тему…",
+    "Now: “{}”": "Сейчас: «{}»",
+    "The current desktop is not saved as a theme": "Текущий рабочий стол не сохранён как тема",
+    "Theme “{}” is already applied, no changes.": "Тема «{}» уже применена, изменений нет.",
+    "The desktop has changed since “{}” was applied.\nReset it to the saved theme?\n"
+    "(The current state goes to a backup.)":
+        "Рабочий стол изменён после применения «{}».\nВернуть его к сохранённому виду темы?\n"
+        "(Текущее состояние уйдёт в резервную копию.)",
+    "The desktop has changed since “{}” was applied.\nSave the changes to “{}” before switching?":
+        "Рабочий стол изменён после применения «{}».\nСохранить изменения в «{}» перед переключением?",
+    "Theme “{}” applied": "Тема «{}» применена",
+    "New theme name:": "Имя новой темы:",
+    "Theme “{}” already exists. Overwrite?": "Тема «{}» уже есть. Перезаписать?",
+    "Panels and widgets will be reset to the defaults.\nThe current state goes to a backup. Continue?":
+        "Панели и виджеты будут сброшены к стандартным.\n"
+        "Текущее состояние уйдёт в резервную копию. Продолжить?",
+    "Save the changes to “{}”?": "Сохранить изменения в «{}»?",
+    "Which theme to rename?": "Какую тему переименовать?",
+    "New name:": "Новое имя:",
+    "Which theme to delete?": "Какую тему удалить?",
+    "Delete theme “{}” for good?": "Удалить тему «{}» безвозвратно?",
+    "Something went wrong. Details: {}": "Не получилось. Подробности: {}",
+    "Error in desk:\n\n{}\n\nFull log: {}": "Ошибка в desk:\n\n{}\n\nПолностью: {}",
+    "Usage: desk {} NAME": "Использование: desk {} ИМЯ",
+    "Usage: desk mv OLD NEW": "Использование: desk mv СТАРОЕ НОВОЕ",
+}
+
+
+def tr(text, *args):
+    if LANG == "ru":
+        text = RU.get(text, text)
+    return text.format(*args) if args else text
+
+
+# ── KDE ini ────────────────────────────────────────────────────────────────────
+# KConfig is not quite ini: headers look like [A][B][C], keys like key[$e]. So a small
+# parser of its own: lines are kept verbatim, groups and keys are compared by name.
+
+def parse_ini(text):
+    groups, name, lines = [], "", []
+    for line in text.splitlines():
+        if line.startswith("[") and line.rstrip().endswith("]"):
+            groups.append((name, lines))
+            name, lines = line.rstrip()[1:-1], []
+        else:
+            lines.append(line)
+    groups.append((name, lines))
+    return groups
+
+
+def dump_ini(groups):
+    out = []
+    for name, lines in groups:
+        body = list(lines)
+        while body and body[-1].strip() == "":
+            body.pop()
+        if name == "" and not body:
+            continue
+        if name:
+            out.append(f"[{name}]")
+        out.extend(body)
+        out.append("")
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def key_of(line):
+    if "=" not in line or line.lstrip().startswith("#"):
+        return None
+    return re.sub(r"\[\$.*?\]$", "", line.split("=", 1)[0].strip())
+
+
+def matches(rule, group):
+    kind, arg = rule[0], rule[1]
+    return (kind == "group" and group == arg) or (kind == "prefix" and group.startswith(arg))
+
+
+def extract(text, rules):
+    """The part of a file a theme takes."""
+    picked = []
+    for name, lines in parse_ini(text):
+        if any(matches(r, name) for r in rules if r[0] != "keys"):
+            picked.append((name, lines))
+        for r in rules:
+            if r[0] == "keys" and name == r[1]:
+                kept = [l for l in lines if key_of(l) in r[2]]
+                if kept:
+                    picked.append((name, kept))
+    return dump_ini(picked) if picked else ""
+
+
+def merge(current, saved, rules):
+    """The live file with the theme's part replaced by the saved one."""
+    groups = parse_ini(current)
+    out = []
+    for name, lines in groups:
+        if any(matches(r, name) for r in rules if r[0] != "keys"):
+            continue
+        for r in rules:
+            if r[0] == "keys" and name == r[1]:
+                lines = [l for l in lines if key_of(l) not in r[2]]
+        out.append((name, lines))
+    for name, lines in parse_ini(saved):
+        if not name:
+            continue
+        for i, (n, l) in enumerate(out):
+            if n == name:
+                out[i] = (n, [x for x in l if x.strip()] + lines)
+                break
+        else:
+            out.append((name, lines))
+    return dump_ini(out)
+
+
+LANG = language()
+
+
+# ── Themes ─────────────────────────────────────────────────────────────────────
+
+def theme_dir(name):
+    if not name or name.startswith(".") or "/" in name:
+        die(tr("Invalid theme name: “{}”", name))
+    return ROOT / name
+
+
+def themes():
+    if not ROOT.exists():
+        return []
+    return sorted(p.name for p in ROOT.iterdir() if p.is_dir() and not p.name.startswith("."))
+
+
+def current():
+    try:
+        return CURRENT.read_text().strip()
+    except OSError:
+        return ""
+
+
+def snapshot(dest, with_assets=True):
+    """Take the current state into dest/config."""
+    tmp = dest.with_name(dest.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    (tmp / "config").mkdir(parents=True)
+    absent = []
+    for rel in WHOLE:
+        src = CONFIG / rel
+        dst = tmp / "config" / rel
+        if src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        else:
+            absent.append(rel)
+    (tmp / "config" / ABSENT).write_text("".join(r + "\n" for r in absent))
+    for rel in WHOLE_DIRS:
+        if (CONFIG / rel).is_dir():
+            shutil.copytree(CONFIG / rel, tmp / "config" / rel)
+    absent_data = []
+    for rel in DATA_DIRS:
+        if (SHARE / rel).is_dir():
+            shutil.copytree(SHARE / rel, tmp / "share" / rel, symlinks=True)
+        else:
+            absent_data.append(rel)
+    (tmp / "config" / ABSENT_DATA).write_text("".join(r + "\n" for r in absent_data))
+    for rel, rules in PARTIAL.items():
+        src = CONFIG / rel
+        part = extract(src.read_text(errors="replace"), rules) if src.is_file() else ""
+        (tmp / "config" / (rel + ".part")).write_text(part)
+    # An Aurorae decoration keeps its settings in ~/.config/<theme>rc.
+    kwin = CONFIG / "kwinrc"
+    if kwin.is_file():
+        m = re.search(r"^theme=__aurorae__svg__(.+)$", kwin.read_text(errors="replace"), re.M)
+        if m and (CONFIG / f"{m.group(1)}rc").is_file():
+            shutil.copy2(CONFIG / f"{m.group(1)}rc", tmp / "config" / f"{m.group(1)}rc")
+    collect_assets(tmp, copy=with_assets)
+    # The icon and preview are not part of the snapshot: carry them over from the old version.
+    for extra in KEEP_FILES:
+        if (dest / extra).is_file():
+            shutil.copy2(dest / extra, tmp / extra)
+    shutil.rmtree(dest, ignore_errors=True)
+    tmp.rename(dest)
+
+
+def collect_assets(tmp, copy=True):
+    """Copy the wallpapers the snapshot references into .assets/ and point the references there.
+
+    A copy is named by a hash of its contents, so with copy=False references are rewritten
+    the same way without copying: a snapshot taken for comparison then matches the saved
+    theme even while the live config still points at the original files.
+    """
+    if copy:
+        ASSETS.mkdir(parents=True, exist_ok=True)
+    for f in (tmp / "config").rglob("*"):
+        if not f.is_file():
+            continue
+        try:
+            text = f.read_text()
+        except UnicodeDecodeError:
+            continue
+
+        def repl(m):
+            raw = m.group(1)
+            path = Path(unquote(raw))
+            if not path.is_file() or path.parent == ASSETS:
+                return m.group(0)
+            h = hashlib.sha1(path.read_bytes()).hexdigest()[:12]
+            stored = ASSETS / f"{h}-{path.name}"
+            if copy and not stored.exists():
+                shutil.copy2(path, stored)
+            new = str(stored)
+            if raw != unquote(raw):                   # the reference was %-encoded
+                new = quote(new)
+            return m.group(0).replace(raw, new)
+
+        new_text = PATH_RE.sub(repl, text)
+        if new_text != text:
+            f.write_text(new_text)
+
+
+def gc_assets():
+    """Drop wallpapers from .assets/ that no theme, backup or ~/.config references."""
+    if not ASSETS.exists():
+        return
+    refs = ""
+    dirs = [p for p in ROOT.iterdir() if p.is_dir()]
+    if BACKUPS.exists():
+        dirs += [p for p in BACKUPS.iterdir() if p.is_dir()]
+    for base in [p / "config" for p in dirs]:
+        for f in base.rglob("*"):
+            if f.is_file():
+                refs += f.read_text(errors="replace")
+    for rel in WHOLE + list(PARTIAL):
+        f = CONFIG / rel
+        if f.is_file():
+            refs += f.read_text(errors="replace")
+    refs = refs + unquote(refs)
+    for a in ASSETS.iterdir():
+        if a.name not in refs:
+            a.unlink()
+
+
+def write_back(src_dir):
+    """Write the snapshot src_dir into ~/.config. Plasma must be stopped at this point."""
+    cfg = src_dir / "config"
+    for rel in WHOLE:
+        src, dst = cfg / rel, CONFIG / rel
+        if src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+    if (cfg / ABSENT).is_file():
+        for rel in (cfg / ABSENT).read_text().split():
+            if rel in WHOLE and (CONFIG / rel).is_file():
+                (CONFIG / rel).unlink()
+    for rel in WHOLE_DIRS:
+        if (cfg / rel).is_dir():
+            shutil.rmtree(CONFIG / rel, ignore_errors=True)
+            shutil.copytree(cfg / rel, CONFIG / rel)
+    gone = (cfg / ABSENT_DATA).read_text().split() if (cfg / ABSENT_DATA).is_file() else []
+    for rel in DATA_DIRS:
+        src = src_dir / "share" / rel
+        if src.is_dir() or rel in gone:
+            shutil.rmtree(SHARE / rel, ignore_errors=True)
+        if src.is_dir():
+            shutil.copytree(src, SHARE / rel, symlinks=True)
+    for rel, rules in PARTIAL.items():
+        part = cfg / (rel + ".part")
+        if not part.is_file():
+            continue
+        dst = CONFIG / rel
+        cur = dst.read_text(errors="replace") if dst.is_file() else ""
+        dst.write_text(merge(cur, part.read_text(), rules))
+    for f in cfg.glob("*rc"):
+        if f.name not in WHOLE:
+            shutil.copy2(f, CONFIG / f.name)
+
+
+def data_dirs():
+    dirs = [SHARE] + [Path(d) for d in (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":") if d]
+    return list(dict.fromkeys(dirs))
+
+
+def plugin_dirs():
+    """Qt 6 plugin directories: they differ between distributions."""
+    dirs = [Path(d) for d in os.environ.get("QT_PLUGIN_PATH", "").split(":") if d]
+    dirs += [Path(d) for d in glob.glob("/usr/lib*/qt6/plugins") + glob.glob("/usr/lib/*/qt6/plugins")]
+    return list(dict.fromkeys(dirs))
+
+
+def missing_deps(src_dir):
+    """Widgets, wallpaper plugins and looks the theme references but that are not installed."""
+    cfg = src_dir / "config"
+    text = ""
+    for f in cfg.rglob("*"):
+        if f.is_file():
+            text += f.read_text(errors="replace") + "\n"
+    share, plugins = data_dirs(), plugin_dirs()
+    out = []
+
+    def have(*rels):
+        return any((b / r).exists() for b in share for r in rels)
+
+    def have_plugin(rel):
+        return any((b / rel).exists() for b in plugins)
+
+    for pid in sorted(set(re.findall(r"^plugin=(\S+)$", text, re.M))):
+        if not (have(f"plasma/plasmoids/{pid}") or have_plugin(f"plasma/applets/{pid}.so")):
+            out.append(tr("widget {}", pid))
+    for wid in sorted(set(re.findall(r"^wallpaperplugin=(\S+)$", text, re.M))):
+        if not (have(f"plasma/wallpapers/{wid}") or have_plugin(f"plasma/wallpapers/{wid}.so")):
+            out.append(tr("wallpaper plugin {}", wid))
+    for k, rel in [("LookAndFeelPackage", "plasma/look-and-feel/{}"), ("cursorTheme", "icons/{}"),
+                   ("ColorScheme", "color-schemes/{}.colors")]:
+        for v in set(re.findall(rf"^{k}=(.+)$", text, re.M)):
+            if k == "cursorTheme" and (HOME / ".icons" / v).exists():   # cursors may live in ~/.icons
+                continue
+            if not have(rel.format(v)):
+                out.append(f"{k}={v}")
+    for v in set(re.findall(r"^\[Icons\]\nTheme=(.+)$", text, re.M)):
+        if not (have(f"icons/{v}") or (HOME / ".icons" / v).exists()):
+            out.append(tr("icons {}", v))
+    return out
+
+
+# ── Plasma ─────────────────────────────────────────────────────────────────────
+
+def run(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]}: not found")
+
+
+def shell_under_systemd():
+    return run("systemctl", "--user", "--quiet", "is-active", "plasma-plasmashell.service").returncode == 0
+
+
+def stop_shell():
+    if shell_under_systemd():
+        run("systemctl", "--user", "stop", "plasma-plasmashell.service")
+    else:
+        run("kquitapp6", "plasmashell")
+    for _ in range(50):
+        if run("pgrep", "-x", "plasmashell").returncode != 0:
+            return
+        time.sleep(0.1)
+
+
+def start_shell():
+    if run("systemctl", "--user", "start", "plasma-plasmashell.service").returncode != 0:
+        subprocess.Popen(["kstart", "plasmashell"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def read_key(rel, group, key):
+    r = run("kreadconfig6", "--file", str(CONFIG / rel), "--group", group, "--key", key)
+    return r.stdout.strip()
+
+
+def changeicons():
+    """plasma-changeicons sits in libexec, which differs between distributions."""
+    for pattern in ("/usr/libexec/plasma-changeicons", "/usr/lib*/libexec/plasma-changeicons",
+                    "/usr/lib/*/libexec/plasma-changeicons", "/usr/lib/*/plasma-changeicons"):
+        for p in glob.glob(pattern):
+            return p
+    return None
+
+
+def notify_apps():
+    """Tell running applications and KWin that the look has changed."""
+    scheme = read_key("kdeglobals", "General", "ColorScheme")
+    if scheme:
+        run("plasma-apply-colorscheme", scheme)
+    cursor = read_key("kcminputrc", "Mouse", "cursorTheme") or "breeze_cursors"
+    run("plasma-apply-cursortheme", cursor)
+    icons = read_key("kdeglobals", "Icons", "Theme") or "breeze"
+    tool = changeicons()
+    if tool:
+        run(tool, icons)
+    for change in (0, 1, 2, 3, 4, 5):   # palette, fonts, style, settings, icons, cursor
+        run("busctl", "--user", "emit", "/KGlobalSettings", "org.kde.KGlobalSettings",
+            "notifyChange", "ii", str(change), "0")
+    # The same signal KConfig sends when writing with the Notify flag: on it running apps and
+    # kde-gtk-config (which carries font, icons and cursor over to GTK) reload the look.
+    # desk writes files directly, so it sends the signal itself.
+    for path, groups in [("/kdeglobals", "{'General': [b'font', b'fixed', b'menuFont', "
+                          "b'smallestReadableFont', b'toolBarFont', b'ColorScheme'], "
+                          "'Icons': [b'Theme'], 'KDE': [b'widgetStyle', b'LookAndFeelPackage'], "
+                          "'WM': [b'activeFont']}"),
+                         ("/kcminputrc", "{'Mouse': [b'cursorTheme', b'cursorSize']}"),
+                         # KWin re-reads layout labels only on this signal,
+                         # org.kde.keyboard.reloadConfig does not update them.
+                         ("/kxkbrc", "{'Layout': [b'DisplayNames']}")]:
+        run("gdbus", "emit", "--session", "--object-path", path,
+            "--signal", "org.kde.kconfig.notify.ConfigChanged", groups)
+    run("dbus-send", "--session", "--type=signal", "/Layouts", "org.kde.keyboard.reloadConfig")
+    run("busctl", "--user", "call", "org.kde.KWin", "/KWin", "org.kde.KWin", "reconfigure")
+
+
+def install(src_dir):
+    # plasmashell rewrites its config files on exit, so they are written while it is stopped.
+    stop_shell()
+    try:
+        write_back(src_dir)
+    finally:
+        start_shell()
+    notify_apps()
+
+
+def backup():
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    dest = BACKUPS / time.strftime("%Y-%m-%d_%H-%M-%S")
+    snapshot(dest)
+    (dest / "from").write_text(current())
+    for old in sorted(p for p in BACKUPS.iterdir() if p.is_dir())[:-KEEP_BACKUPS]:
+        shutil.rmtree(old, ignore_errors=True)
+    gc_assets()
+    return dest
+
+
+# Keys widgets rewrite by themselves while working (launch counters in menus, update check
+# times, popup sizes): changing them is not an edit of the desktop.
+VOLATILE = ("appLaunchCounts", "lastUpdateCheckTime", "LastVideoPosition",
+            "popupWidth", "popupHeight", "DialogWidth", "DialogHeight")
+
+
+def ini_key(path):
+    """Contents of an ini regardless of group and line order: merging parts changes it."""
+    text = path.read_text(errors="replace")
+    return sorted((n, tuple(sorted(l for l in ls if l.strip() and key_of(l) not in VOLATILE)))
+                  for n, ls in parse_ini(text) if n or any(l.strip() for l in ls))
+
+
+def is_dirty(name):
+    """Whether the desktop differs from the saved theme name."""
+    d = theme_dir(name)
+    if not d.exists():
+        return False
+    probe = ROOT / ".probe"
+    snapshot(probe, with_assets=False)
+    try:
+        a, b = d / "config", probe / "config"
+        files = {p.relative_to(a) for p in a.rglob("*") if p.is_file()} | \
+                {p.relative_to(b) for p in b.rglob("*") if p.is_file()}
+        for rel in files:
+            x, y = a / rel, b / rel
+            if not (x.is_file() and y.is_file()) or ini_key(x) != ini_key(y):
+                return True
+        return False
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+
+
+# ── Previews and the list for the switcher ─────────────────────────────────────
+
+def make_preview(name, force=False):
+    """preview.jpg 480×270 from the theme's wallpaper (a frame if it is a video)."""
+    d = theme_dir(name)
+    out = d / "preview.jpg"
+    if out.is_file() and not force:
+        return out
+    t = d / "config/plasma-org.kde.plasma.desktop-appletsrc"
+    if not t.is_file():
+        return None
+    text = t.read_text(errors="replace")
+    main_screen = setting("PreviewScreen", "0")
+    cands = []
+    for block in re.split(r"(?m)^(?=\[Containments\]\[\d+\]\n)", text):
+        m = re.match(r"\[Containments\]\[(\d+)\]\n", block)
+        if not m or "formfactor=0" not in block:
+            continue
+        cid = m.group(1)
+        screen = re.search(r"(?m)^lastScreen=(\d+)", block)
+        prio = 0 if screen and screen.group(1) == main_screen else 1
+        wp = re.findall(rf"(?ms)^\[Containments\]\[{cid}\]\[Wallpaper\]\[[^\]]+\]\[General\]\n(.*?)(?=^\[|\Z)", text)
+        for body in wp:
+            for raw in re.findall(r"(?:file://)?(/[^\n\"',;]+)", body):
+                path = Path(unquote(raw))
+                if path.is_dir():              # wallpaper package: the largest image inside
+                    imgs = sorted((path / "contents/images").glob("*"), key=lambda f: f.stat().st_size)
+                    path = imgs[-1] if imgs else path
+                if path.is_file() and re.search(MEDIA + "$", path.name, re.I):
+                    cands.append((prio, path))
+    if not cands:
+        # A wallpaper without an image (a web page, a plain color): use the lock screen image.
+        lock = d / "config/kscreenlockerrc.part"
+        if lock.is_file():
+            for raw in re.findall(r"(?:file://)?(/[^\n\"',;]+)", lock.read_text(errors="replace")):
+                path = Path(unquote(raw))
+                if path.is_file() and re.search(MEDIA + "$", path.name, re.I):
+                    cands.append((2, path))
+    if not cands:
+        return None
+    src = sorted(cands, key=lambda c: c[0])[0][1]
+    vf = "scale=480:270:force_original_aspect_ratio=increase,crop=480:270"
+    r = run("ffmpeg", "-v", "error", "-y", "-ss", "3", "-i", str(src), "-frames:v", "1",
+            "-vf", vf, "-q:v", "3", str(out))
+    if r.returncode != 0 or not out.is_file():   # shorter than 3 s or a still image
+        run("ffmpeg", "-v", "error", "-y", "-i", str(src), "-frames:v", "1", "-vf", vf, "-q:v", "3", str(out))
+    return out if out.is_file() else None
+
+
+def cmd_json():
+    import json
+    cur = current()
+    out = []
+    for n in themes():
+        d = ROOT / n
+        prev = make_preview(n)
+        out.append({"name": n, "current": n == cur,
+                    "dirty": n == cur and is_dirty(n),
+                    "icon": str(d / "icon.svg") if (d / "icon.svg").is_file() else "",
+                    "preview": str(prev) if prev else ""})
+    print(json.dumps({"current": cur, "lang": LANG, "themes": out}, ensure_ascii=False))
+
+
+# ── Commands ───────────────────────────────────────────────────────────────────
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        LOG.write_text(msg + "\n")
+    except OSError:
+        pass
+    sys.exit(1)
+
+
+def cmd_list():
+    cur = current()
+    names = themes()
+    if not names:
+        print(tr("No themes yet. Save the current desktop: desk save NAME"))
+    for n in names:
+        print(("* " if n == cur else "  ") + n)
+
+
+def cmd_save(name):
+    d = theme_dir(name)
+    ROOT.mkdir(parents=True, exist_ok=True)
+    snapshot(d)
+    CURRENT.write_text(name)
+    gc_assets()
+    print(tr("Theme “{}” saved: {}", name, d))
+
+
+def cmd_apply(name):
+    d = theme_dir(name)
+    if not d.exists():
+        die(tr("No theme “{}”. Available: {}", name, ", ".join(themes()) or tr("nothing")))
+    for m in missing_deps(d):
+        print(tr("⚠ not installed: {}", m), file=sys.stderr)
+    b = backup()
+    install(d)
+    CURRENT.write_text(name)
+    print(tr("Theme “{}” applied. Previous state: {}", name, b))
+
+
+def cmd_rm(name):
+    d = theme_dir(name)
+    if not d.exists():
+        die(tr("No theme “{}”", name))
+    shutil.rmtree(d)
+    if name == current():
+        CURRENT.write_text("")
+    gc_assets()
+    print(tr("Theme “{}” deleted", name))
+
+
+def cmd_mv(old, new):
+    a, b = theme_dir(old), theme_dir(new)
+    if not a.exists():
+        die(tr("No theme “{}”", old))
+    if b.exists():
+        die(tr("Theme “{}” already exists", new))
+    a.rename(b)
+    if current() == old:
+        CURRENT.write_text(new)
+    print(f"“{old}” → “{new}”")
+
+
+def cmd_clean():
+    b = backup()
+    laf = read_key("kdeglobals", "KDE", "LookAndFeelPackage") or "org.kde.breezedark.desktop"
+    r = run("plasma-apply-lookandfeel", "--apply", laf, "--resetLayout")
+    if r.returncode != 0:
+        die(r.stderr.strip() or tr("plasma-apply-lookandfeel failed"))
+    CURRENT.write_text("")
+    print(tr("Layout reset to stock ({}). Previous state: {}\nBuild a new desktop and save it: desk save NAME", laf, b))
+
+
+def cmd_restore():
+    olds = sorted(p for p in BACKUPS.iterdir() if p.is_dir()) if BACKUPS.exists() else []
+    if not olds:
+        die(tr("No backups"))
+    last = olds[-1]
+    install(last)
+    try:
+        CURRENT.write_text((last / "from").read_text())
+    except OSError:
+        pass
+    shutil.rmtree(last)
+    print(tr("Restored the state from {}", last.name))
+
+
+# ── Window ─────────────────────────────────────────────────────────────────────
+
+def kd(*args):
+    r = subprocess.run(["kdialog", "--title", tr("Desktop Themes"), *args],
+                       capture_output=True, text=True)
+    return r.returncode, r.stdout.strip()
+
+
+def gui():
+    cur = current()
+    items = []
+    for n in themes():
+        items += [f"apply:{n}", ("● " if n == cur else "    ") + n]
+    items += ["save", "💾 " + tr("Save the current desktop as a new theme…")]
+    if cur:
+        items += ["update", "💾 " + tr("Overwrite theme “{}” with the current state", cur)]
+    items += ["clean", "✨ " + tr("Start a new theme from a clean desktop"),
+              "restore", "↩ " + tr("Go back to the state before the last switch")]
+    if themes():
+        items += ["mv", "✏ " + tr("Rename a theme…"), "rm", "🗑 " + tr("Delete a theme…")]
+    head = tr("Now: “{}”", cur) if cur else tr("The current desktop is not saved as a theme")
+    rc, choice = kd("--menu", head, *items)
+    if rc != 0:
+        return
+    try:
+        if choice.startswith("apply:"):
+            name = choice[6:]
+            if name == cur:
+                if not is_dirty(cur):
+                    kd("--msgbox", tr("Theme “{}” is already applied, no changes.", cur))
+                    return
+                rc, _ = kd("--warningyesno", tr("The desktop has changed since “{}” was applied.\n"
+                                                "Reset it to the saved theme?\n"
+                                                "(The current state goes to a backup.)", cur))
+                if rc == 0:
+                    cmd_apply(name)
+                return
+            if cur and is_dirty(cur):
+                rc, _ = kd("--yesnocancel", tr("The desktop has changed since “{}” was applied.\n"
+                                               "Save the changes to “{}” before switching?", cur, cur))
+                if rc == 2:
+                    return
+                if rc == 0:
+                    cmd_save(cur)
+            cmd_apply(name)
+            kd("--passivepopup", tr("Theme “{}” applied", name), "3")
+        elif choice in ("save", "update"):
+            name = cur if choice == "update" else ""
+            if not name:
+                rc, name = kd("--inputbox", tr("New theme name:"))
+                if rc != 0 or not name.strip():
+                    return
+                name = name.strip()
+                if name in themes():
+                    rc, _ = kd("--warningyesno", tr("Theme “{}” already exists. Overwrite?", name))
+                    if rc != 0:
+                        return
+            cmd_save(name)
+            kd("--passivepopup", tr("Theme “{}” saved: {}", name, theme_dir(name)), "3")
+        elif choice == "clean":
+            rc, _ = kd("--warningyesno", tr("Panels and widgets will be reset to the defaults.\n"
+                                            "The current state goes to a backup. Continue?"))
+            if rc == 0:
+                if cur and is_dirty(cur):
+                    rc, _ = kd("--yesno", tr("Save the changes to “{}”?", cur))
+                    if rc == 0:
+                        cmd_save(cur)
+                cmd_clean()
+        elif choice == "restore":
+            cmd_restore()
+        elif choice == "mv":
+            rc, old = kd("--combobox", tr("Which theme to rename?"), *themes())
+            if rc == 0 and old:
+                rc, new = kd("--inputbox", tr("New name:"), old)
+                if rc == 0 and new.strip() and new.strip() != old:
+                    cmd_mv(old, new.strip())
+        elif choice == "rm":
+            rc, name = kd("--combobox", tr("Which theme to delete?"), *themes())
+            if rc == 0 and name:
+                rc, _ = kd("--warningyesno", tr("Delete theme “{}” for good?", name))
+                if rc == 0:
+                    cmd_rm(name)
+    except SystemExit as e:
+        if e.code:
+            kd("--error", tr("Something went wrong. Details: {}", LOG))
+        raise
+    except Exception:
+        import traceback
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        LOG.write_text(traceback.format_exc())
+        kd("--error", tr("Error in desk:\n\n{}\n\nFull log: {}", traceback.format_exc(limit=3)[-1500:], LOG))
+        raise
+
+
+def main(argv):
+    if not argv or argv[0] == "gui":
+        return gui()
+    cmd, args = argv[0], argv[1:]
+    one = lambda: args[0] if args else die(tr("Usage: desk {} NAME", cmd))
+    if cmd in ("list", "ls"):
+        cmd_list()
+    elif cmd == "save":
+        cmd_save(one())
+    elif cmd == "apply":
+        cmd_apply(one())
+    elif cmd in ("rm", "delete"):
+        cmd_rm(one())
+    elif cmd == "json":
+        cmd_json()
+    elif cmd == "preview":
+        for n in (args or themes()):
+            print(n, make_preview(n, force=True))
+    elif cmd == "mv":
+        len(args) == 2 or die(tr("Usage: desk mv OLD NEW"))
+        cmd_mv(*args)
+    elif cmd == "clean":
+        cmd_clean()
+    elif cmd == "restore":
+        cmd_restore()
+    else:
+        print(__doc__.strip())
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
