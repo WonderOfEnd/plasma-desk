@@ -506,6 +506,9 @@ def stop_shell():
 
 
 def start_shell():
+    # A few switches in a row trip systemd's start rate limit ("start-limit-hit") and the
+    # shell stays down; clearing the failed state lifts the limit for this start.
+    run("systemctl", "--user", "reset-failed", "plasma-plasmashell.service")
     if run("systemctl", "--user", "start", "plasma-plasmashell.service").returncode != 0:
         subprocess.Popen(["kstart", "plasmashell"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
