@@ -585,10 +585,19 @@ VOLATILE = ("appLaunchCounts", "lastUpdateCheckTime", "LastVideoPosition",
             "popupWidth", "popupHeight", "DialogWidth", "DialogHeight")
 
 
+def unordered(line):
+    """Widget geometries (ItemGeometries*=Applet-1:…;Applet-2:…;) in a fixed order: Plasma
+    reorders the entries when it rewrites the file, the layout itself stays the same."""
+    k, _, v = line.partition("=")
+    if k.startswith("ItemGeometries"):
+        return k + "=" + ";".join(sorted(x for x in v.split(";") if x))
+    return line
+
+
 def ini_key(path):
     """Contents of an ini regardless of group and line order: merging parts changes it."""
     text = path.read_text(errors="replace")
-    return sorted((n, tuple(sorted(l for l in ls if l.strip() and key_of(l) not in VOLATILE)))
+    return sorted((n, tuple(sorted(unordered(l) for l in ls if l.strip() and key_of(l) not in VOLATILE)))
                   for n, ls in parse_ini(text) if n or any(l.strip() for l in ls))
 
 
