@@ -21,6 +21,7 @@ for cmd in python3 kreadconfig6 plasma-apply-colorscheme systemctl; do
 done
 command -v kdialog >/dev/null || echo "note: install kdialog for the 'desk' picker window"
 command -v ffmpeg >/dev/null || echo "note: install ffmpeg for theme previews in the panel switcher"
+command -v kscreen-doctor >/dev/null || echo "note: install kscreen-doctor (kscreen) for desk swap / desk screens"
 
 install -Dm755 "$here/desk" "$bin/desk"
 rm -rf "$plasmoid"

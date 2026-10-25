@@ -19,6 +19,8 @@ PlasmoidItem {
     property bool currentDirty: false
     property bool loading: false
     property string switching: ""
+    property int screensOn: 1
+    property int screensOff: 0
     property string lang: Qt.locale().name.startsWith("ru") ? "ru" : "en"
 
     // Strings follow desk's language (desk json reports it), English by default.
@@ -31,7 +33,10 @@ PlasmoidItem {
         "“%1” has unsaved changes": "В «%1» есть несохранённые изменения",
         "The current desktop is not saved as a theme": "Текущий стол не сохранён как тема",
         "Save": "Сохранить",
-        "New theme, rename, delete…": "Новая тема, переименование, удаление…"
+        "New theme, rename, delete…": "Новая тема, переименование, удаление…",
+        "Swap screens": "Поменять экраны местами",
+        "Turn on all monitors": "Включить все мониторы",
+        "Leave only the main monitor": "Оставить только главный монитор"
     })
     function tr(s, a) { const t = (lang === "ru" && ru[s]) || s; return a === undefined ? t : t.arg(a) }
 
@@ -59,6 +64,7 @@ PlasmoidItem {
                     root.current = j.current
                     if (j.lang) root.lang = j.lang
                     root.currentDirty = j.themes.some(t => t.current && t.dirty)
+                    if (j.screens) { root.screensOn = j.screens.on; root.screensOff = j.screens.off }
                 } catch (e) { root.themes = [] }
             } else if (source.indexOf(" save ") >= 0) {
                 root.refresh()
@@ -74,6 +80,11 @@ PlasmoidItem {
         switching = name
         sh.exec(detached("apply " + q(name)))
     }
+
+    // Monitor commands do not restart the shell, but the screens change under it: run them
+    // detached as well and re-read the state once kscreen has settled.
+    function screens(args) { sh.exec(detached(args)); settle.restart() }
+    Timer { id: settle; interval: 3000; onTriggered: root.refresh() }
 
     onExpandedChanged: function() { if (root.expanded) refresh() }
     Component.onCompleted: refresh()
@@ -117,6 +128,29 @@ PlasmoidItem {
             PC3.BusyIndicator {
                 visible: root.loading
                 implicitWidth: Kirigami.Units.iconSizes.small; implicitHeight: implicitWidth
+            }
+            // Coming back to two monitors: one press turns the rest on as they were.
+            PC3.Button {
+                visible: root.screensOff > 0
+                text: root.tr("Turn on all monitors")
+                icon.name: "video-display"
+                onClicked: root.screens("screens all")
+            }
+            PC3.ToolButton {
+                visible: root.screensOn > 1
+                icon.name: "exchange-positions"
+                display: QQC2.AbstractButton.IconOnly
+                QQC2.ToolTip.text: root.tr("Swap screens")
+                QQC2.ToolTip.visible: hovered
+                onClicked: root.screens("swap")
+            }
+            PC3.ToolButton {
+                visible: root.screensOn > 1
+                icon.name: "video-display"
+                display: QQC2.AbstractButton.IconOnly
+                QQC2.ToolTip.text: root.tr("Leave only the main monitor")
+                QQC2.ToolTip.visible: hovered
+                onClicked: root.screens("screens one")
             }
         }
 

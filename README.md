@@ -49,15 +49,17 @@ and KWin, so the switch takes effect at once without logging out. It also:
 | Keyboard layout labels in the tray | `DisplayNames` in `kxkbrc` |
 | Default file manager | `inode/directory` in `mimeapps.list` |
 | KRunner position (top or centered) | `FreeFloating` in `krunnerrc` |
+| Which monitor holds the main desktop | `main-output` in the theme directory |
 
-Not saved, on purpose: shortcuts, mouse and touchpad, displays, tiling, locale, power
+Not saved, on purpose: shortcuts, mouse and touchpad, the display layout, tiling, locale, power
 settings, and the settings of your applications. The themes themselves (icon packs, Plasma
 styles, widgets) are referenced by name, not copied: install them as usual.
 
 ## Install
 
 Requirements: KDE Plasma 6, Python 3.8+, `kdialog` (picker window), `ffmpeg` (optional,
-previews for the panel widget).
+previews for the panel widget), `kscreen-doctor` (comes with KScreen; for the monitor
+commands).
 
 ```sh
 git clone https://github.com/WonderOfEnd/plasma-desk
@@ -88,6 +90,32 @@ desk clean            reset to the stock Plasma layout to build a new theme
 desk restore          go back to the state before the last switch
 desk json             themes as JSON (used by the panel widget)
 desk preview [NAME…]  regenerate preview images
+desk swap             move the main desktop to the other monitor
+desk screens one [OUTPUT]   leave only one monitor on (the main one by default)
+desk screens all      turn the other monitors back on, as they were
+```
+
+### Several monitors
+
+Plasma puts desktops and panels on screens in the order of output priority: its screen 0
+is always the primary monitor. `desk` builds on that: the main desktop of a theme (the
+wallpaper and widgets you care about most) lives on screen 0, and the theme remembers which
+monitor that is (`main-output`, by connector name such as `DP-3`).
+
+- `desk swap` makes the other monitor the main one. Plasma moves the desktops and panels at
+  once, without a restart, and the current theme remembers the choice. Applying a theme
+  makes its main monitor primary again.
+- When only one monitor is left on, it is screen 0 and shows the main desktop, whichever
+  monitor it is. When the others come back, everything returns to its place.
+- `desk screens one [OUTPUT]` saves the display layout and turns off all monitors but one.
+  `desk screens all` turns them back on with their old positions and modes, and makes the
+  theme's main monitor primary.
+
+The panel widget has buttons for all three. One use: turn a monitor off automatically when
+you stream the desktop with Sunshine, with a prep command in `sunshine.conf`:
+
+```ini
+global_prep_cmd = [{"do":"/home/you/.local/bin/desk screens one DP-3","undo":"","elevated":false}]
 ```
 
 ### Panel widget
@@ -96,6 +124,8 @@ Add **Desktop Themes** to a panel. Clicking it shows a card for each theme. A ca
 preview made from the theme's wallpaper (a video frame for video wallpapers) and the theme's
 icon. Click a card to switch. The widget also shows when the applied theme has unsaved
 changes and lets you save them. The ⚙ button opens the full picker (new, rename, delete).
+With two monitors on, the header has buttons to swap screens and to leave only the main
+monitor; with one turned off, a "Turn on all monitors" button.
 
 To give a theme its own icon, put an `icon.svg` (white, 24×24 works best) into
 `~/.local/share/desk-themes/<name>/`. To use your own preview, replace `preview.jpg` there.
