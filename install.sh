@@ -9,9 +9,11 @@ data="${XDG_DATA_HOME:-$HOME/.local/share}"
 plasmoid="$data/plasma/plasmoids/local.desk.switcher"
 icon="$data/icons/hicolor/scalable/apps/desk-themes-symbolic.svg"
 menu="$data/applications/desk-themes.desktop"
+unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/desk-watch.service"
 
 if [ "${1:-}" = "--uninstall" ]; then
-    rm -rf "$bin/desk" "$plasmoid" "$icon" "$menu"
+    systemctl --user disable --now desk-watch.service 2>/dev/null || true
+    rm -rf "$bin/desk" "$plasmoid" "$icon" "$menu" "$unit"
     echo "desk removed. Themes stay in $data/desk-themes"
     exit 0
 fi
@@ -30,6 +32,12 @@ cp -r "$here/plasmoid" "$plasmoid"
 install -Dm644 "$here/icons/desk-themes-symbolic.svg" "$icon"
 mkdir -p "$(dirname "$menu")"
 sed "s|@BINDIR@|$bin|" "$here/desk-themes.desktop" > "$menu"
+# The watcher keeps a theme's main desktop on its monitor when monitors are turned on or off.
+mkdir -p "$(dirname "$unit")"
+sed "s|@BINDIR@|$bin|" "$here/desk-watch.service" > "$unit"
+systemctl --user daemon-reload
+systemctl --user enable desk-watch.service >/dev/null 2>&1 || true
+systemctl --user restart desk-watch.service || echo "note: could not start desk-watch.service"
 
 echo "desk installed: $bin/desk"
 echo "Add the \"Desktop Themes\" widget to a panel; if it was already there, restart Plasma:"

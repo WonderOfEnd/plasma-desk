@@ -90,29 +90,37 @@ desk clean            reset to the stock Plasma layout to build a new theme
 desk restore          go back to the state before the last switch
 desk json             themes as JSON (used by the panel widget)
 desk preview [NAME…]  regenerate preview images
-desk swap             move the main desktop to the other monitor
-desk screens one [OUTPUT]   leave only one monitor on (the main one by default)
+desk swap             move the theme's main desktop to the other monitor
+desk screens one [OUTPUT]   leave only one monitor on (the theme's main one by default)
+desk watch            keep the main desktop in place while monitors come and go
 desk screens all      turn the other monitors back on, as they were
 ```
 
 ### Several monitors
 
-Plasma puts desktops and panels on screens in the order of output priority: its screen 0
-is always the primary monitor. `desk` builds on that: the main desktop of a theme (the
-wallpaper and widgets you care about most) lives on screen 0, and the theme remembers which
-monitor that is (`main-output`, by connector name such as `DP-3`).
+Two things are often mixed up here. The system's **primary monitor** (System Settings →
+Display) is where games, new windows and notifications go. A theme's **main monitor** is
+where its main desktop is: the wallpaper and widgets you made the theme for. `desk` keeps
+them separate. You can play on the left monitor while the theme's clock and widgets stay
+on the right.
 
-- `desk swap` makes the other monitor the main one. Plasma moves the desktops and panels at
-  once, without a restart, and the current theme remembers the choice. Applying a theme
-  makes its main monitor primary again.
-- When only one monitor is left on, it is screen 0 and shows the main desktop, whichever
-  monitor it is. When the others come back, everything returns to its place.
-- `desk screens one [OUTPUT]` saves the display layout and turns off all monitors but one.
-  `desk screens all` turns them back on with their old positions and modes, and makes the
-  theme's main monitor primary.
+A theme remembers its main monitor (`main-output`, by connector name such as `DP-3`).
+Plasma itself numbers screens by monitor priority, so `desk` renumbers the screens of the
+layout when it applies a theme. The main desktop goes to the main monitor's screen, the rest
+keep their order.
 
-The panel widget has buttons for all three. One use: turn a monitor off automatically when
-you stream the desktop with Sunshine, with a prep command in `sunshine.conf`:
+- `desk swap` moves the theme's main desktop to the other monitor and remembers that in the
+  theme. The system's primary monitor stays as it is.
+- When only one monitor is left on, it shows the main desktop, whichever monitor it is. When
+  the others come back, everything returns to its place. A small user service,
+  `desk-watch` (installed and started by `install.sh`), notices monitors going on and off and
+  moves the desktops. Plasma restarts for a couple of seconds when that happens.
+- `desk screens one [OUTPUT]` saves the display layout and turns off all monitors but one
+  (by default the theme's main monitor). `desk screens all` turns them back on with their old
+  positions, modes and the old primary monitor.
+
+The panel widget has buttons for these. One use: turn a monitor off automatically when you
+stream the desktop with Sunshine, with a prep command in `sunshine.conf`:
 
 ```ini
 global_prep_cmd = [{"do":"/home/you/.local/bin/desk screens one DP-3","undo":"","elevated":false}]

@@ -17,8 +17,10 @@ a theme remembers which monitor holds its main desktop (desk swap).
     desk json             themes as JSON (used by the panel switcher)
     desk preview [NAME…]  regenerate preview images
     desk swap             move the main desktop to the other monitor (saved into the theme)
-    desk screens one [OUTPUT]  leave only one monitor on (default: the main one)
+    desk screens one [OUTPUT]  leave only one monitor on (default: the theme's main one)
     desk screens all      turn the other monitors back on, as they were
+    desk watch            keep the main desktop on the theme's main monitor while monitors
+                          come and go (runs as the desk-watch user service)
 
 Themes live in ~/.local/share/desk-themes/<name>/config/ — whole files and parts of files
 from ~/.config. Wallpapers they reference are copied into the shared
@@ -32,6 +34,7 @@ Settings (optional), ~/.config/deskrc:
 """
 
 import glob
+import fcntl
 import hashlib
 import json
 import os
@@ -86,6 +89,10 @@ KEEP_FILES = ["icon.svg", "preview.jpg"]
 
 # Connector name (DP-3, HDMI-A-1…) of the monitor with the theme's main desktop.
 MAIN_OUTPUT = "main-output"
+# Where the theme's screens are on the live desktop: live Plasma screen of theme screen 0, 1…
+PLACED = ROOT / ".placed"
+LOCK = ROOT / ".lock"
+PLASMA_RC = "plasma-org.kde.plasma.desktop-appletsrc"
 # Monitor layout saved by "desk screens one", restored by "desk screens all".
 SCREENS = ROOT / ".screens.json"
 
@@ -332,6 +339,10 @@ def snapshot(dest, with_assets=True):
             shutil.copy2(src, dst)
         else:
             absent.append(rel)
+    # Themes are stored with their main desktop on screen 0, wherever it is on the live desktop.
+    rc = tmp / "config" / PLASMA_RC
+    if rc.is_file():
+        rc.write_text(move_screens(rc.read_text(), placed(), list(range(len(placed())))))
     (tmp / "config" / ABSENT).write_text("".join(r + "\n" for r in absent))
     for rel in WHOLE_DIRS:
         if (CONFIG / rel).is_dir():
@@ -358,12 +369,13 @@ def snapshot(dest, with_assets=True):
     for extra in KEEP_FILES:
         if (dest / extra).is_file():
             shutil.copy2(dest / extra, tmp / extra)
-    # The main monitor is only known while there is a choice; with one monitor on, keep the old one.
+    # The main monitor is a property of the theme (desk swap); a new snapshot takes the monitor
+    # that shows the main desktop now, if there is a choice.
     on = enabled_outputs()
-    if len(on) > 1:
-        (tmp / MAIN_OUTPUT).write_text(main_output(on) + "\n")
-    elif (dest / MAIN_OUTPUT).is_file():
+    if (dest / MAIN_OUTPUT).is_file():
         shutil.copy2(dest / MAIN_OUTPUT, tmp / MAIN_OUTPUT)
+    elif len(on) > 1 and placed()[0] < len(on):
+        (tmp / MAIN_OUTPUT).write_text(on[placed()[0]]["name"] + "\n")
     shutil.rmtree(dest, ignore_errors=True)
     tmp.rename(dest)
 
@@ -575,13 +587,88 @@ def kscreen(*args):
         die(tr("kscreen-doctor failed: {}", (r.stderr or r.stdout).strip()))
 
 
-def apply_main_output(src_dir):
-    """Make the theme's main monitor primary, if it is on and there is a choice."""
-    f = src_dir / MAIN_OUTPUT
-    want = f.read_text().strip() if f.is_file() else ""
-    on = enabled_outputs()
-    if len(on) > 1 and want in (o["name"] for o in on) and main_output(on) != want:
-        kscreen(f"output.{want}.priority.1")
+# The system's primary monitor (where games and new windows go) and a theme's main monitor
+# are separate choices. Plasma only knows the first one, so desk renumbers the screens of the
+# layout: theme screen 0 goes to the live screen of the theme's main monitor, the rest keep
+# their order. With one monitor left it is screen 0 and shows the main desktop.
+
+def theme_main(name=None):
+    f = theme_dir(name or current()) / MAIN_OUTPUT if (name or current()) else None
+    return f.read_text().strip() if f and f.is_file() else ""
+
+
+def placement(main):
+    """Live screen for each theme screen, for the monitors on now."""
+    names = [o["name"] for o in enabled_outputs()]
+    k = names.index(main) if main in names else 0
+    return [k] + [i for i in range(len(names)) if i != k]
+
+
+def placed(n=0):
+    """The placement on the live desktop now (as many screens as there are, at least n)."""
+    try:
+        p = [int(x) for x in PLACED.read_text().split()] or [0]
+    except (OSError, ValueError):
+        p = [0]
+    return p + [i for i in range(max(n, len(p))) if i not in p][:max(0, n - len(p))]
+
+
+def move_screens(text, frm, to):
+    """Renumber screens in the Plasma layout: a thing on screen frm[i] goes to screen to[i]."""
+    n = max(len(frm), len(to))
+    frm = frm + [i for i in range(n) if i not in frm][:n - len(frm)]
+    to = to + [i for i in range(n) if i not in to][:n - len(to)]
+    remap = {f: d for f, d in zip(frm, to)}
+    if all(f == d for f, d in remap.items()):
+        return text
+    def screen(v):
+        return str(remap.get(int(v), int(v))) if v.lstrip("-").isdigit() and int(v) >= 0 else v
+    out, group = [], None
+    for line in text.splitlines():
+        if line.startswith("["):
+            group = line
+        elif re.fullmatch(r"\[Containments\]\[\d+\]", group or "") and line.startswith("lastScreen="):
+            line = "lastScreen=" + screen(line[11:])
+        elif group == "[ScreenMapping]" and line.startswith("screenMapping="):
+            # url,screen,activity,url,screen,activity… — icons pinned to a screen of a folder view.
+            f = line[14:].split(",")
+            line = "screenMapping=" + ",".join(screen(x) if i % 3 == 1 else x for i, x in enumerate(f))
+        out.append(line)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+def place_layout(main):
+    """Put the live layout (Plasma stopped) where it belongs for main; remember the placement."""
+    want = placement(main)
+    rc = CONFIG / PLASMA_RC
+    if rc.is_file():
+        rc.write_text(move_screens(rc.read_text(), placed(), want))
+    PLACED.parent.mkdir(parents=True, exist_ok=True)
+    PLACED.write_text(" ".join(map(str, want)) + "\n")
+
+
+def relayout():
+    """After monitors changed: move the desktops if the main one is not where it belongs."""
+    with locked():
+        n = len(enabled_outputs())
+        if placement(theme_main()) == placed(n)[:n]:
+            return False
+        stop_shell()
+        try:
+            place_layout(theme_main())
+        finally:
+            start_shell()
+        return True
+
+
+class locked:
+    """One desk at a time touches the live layout (the watcher waits for a switch to finish)."""
+    def __enter__(self):
+        LOCK.parent.mkdir(parents=True, exist_ok=True)
+        self.f = open(LOCK, "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+    def __exit__(self, *exc):
+        self.f.close()
 
 
 def changeicons():
@@ -626,12 +713,15 @@ def notify_apps():
 
 def install(src_dir):
     # plasmashell rewrites its config files on exit, so they are written while it is stopped.
-    stop_shell()
-    try:
-        write_back(src_dir)
-        apply_main_output(src_dir)
-    finally:
-        start_shell()
+    with locked():
+        stop_shell()
+        try:
+            write_back(src_dir)
+            PLACED.unlink(missing_ok=True)      # the theme's files are in theme order
+            f = src_dir / MAIN_OUTPUT
+            place_layout(f.read_text().strip() if f.is_file() else "")
+        finally:
+            start_shell()
     notify_apps()
 
 
@@ -648,7 +738,7 @@ def backup():
 
 # Keys widgets rewrite by themselves while working (launch counters in menus, update check
 # times, popup sizes): changing them is not an edit of the desktop.
-VOLATILE = ("appLaunchCounts", "lastUpdateCheckTime", "LastVideoPosition",
+VOLATILE = ("appLaunchCounts", "lastUpdateCheckTime", "LastVideo", "LastVideoPosition",
             "popupWidth", "popupHeight", "DialogWidth", "DialogHeight")
 
 
@@ -666,8 +756,9 @@ def ini_key(path):
     text = path.read_text(errors="replace")
     groups = ((n, tuple(sorted(unordered(l) for l in ls if l.strip() and key_of(l) not in VOLATILE)))
               for n, ls in parse_ini(text))
-    # An empty group (Plasma adds them for widgets with nothing configured) changes nothing.
-    return sorted(g for g in groups if g[1])
+    # An empty group (Plasma adds them for widgets with nothing configured) changes nothing, and
+    # [ScreenMapping] is Plasma's own note of which screen a desktop icon was last seen on.
+    return sorted(g for g in groups if g[1] and g[0] != "ScreenMapping")
 
 
 def is_dirty(name):
@@ -752,7 +843,7 @@ def cmd_json():
     outs = outputs()
     on = enabled_outputs(outs)
     screens = {"on": len(on), "off": sum(1 for o in outs if o.get("connected") and not o.get("enabled")),
-               "main": main_output(on)}
+               "main": on[placed()[0]]["name"] if placed()[0] < len(on) else main_output(on)}
     print(json.dumps({"current": cur, "lang": LANG, "screens": screens, "themes": out}, ensure_ascii=False))
 
 
@@ -846,28 +937,58 @@ def cmd_restore():
 
 
 def cmd_swap():
-    """The next monitor becomes the main one; the current theme remembers it."""
-    on = enabled_outputs()
+    """The theme's main desktop moves to the next monitor; the theme remembers it. The system's
+    primary monitor stays as it is."""
+    on = [o["name"] for o in enabled_outputs()]
     if len(on) < 2:
         die(tr("Only one monitor is on, nothing to swap"))
-    new = on[1]["name"]
-    kscreen(f"output.{new}.priority.1")
     cur = current()
+    now = on[placed()[0]] if placed()[0] < len(on) else on[0]
+    new = on[(on.index(now) + 1) % len(on)]
     if cur and theme_dir(cur).is_dir():
         (theme_dir(cur) / MAIN_OUTPUT).write_text(new + "\n")
+    with locked():
+        stop_shell()
+        try:
+            place_layout(new)
+        finally:
+            start_shell()
     print(tr("Main screen: {}", new))
+
+
+def cmd_watch():
+    """Follow monitors going on and off (the kernel's DRM connectors, read every 2 s) and move
+    the desktops so the main one stays on the theme's main monitor."""
+    def state():
+        return sorted(f"{p.parent.name}={p.read_text().strip()}" for p in Path("/sys/class/drm").glob("card*-*/enabled"))
+    last = None
+    while True:
+        now = state()
+        if now != last:
+            time.sleep(2)                    # let KWin and Plasma settle
+            if state() == now:
+                try:
+                    if relayout():
+                        print(tr("Main screen: {}", theme_main() or main_output()), flush=True)
+                except Exception as e:       # a failed round must not stop the watcher
+                    print(e, file=sys.stderr, flush=True)
+                last = now
+        time.sleep(2)
 
 
 def cmd_screens(args):
     if args[:1] == ["one"]:
         on = enabled_outputs()
-        keep = args[1] if len(args) > 1 else main_output(on)
+        names = [o["name"] for o in on]
+        keep = args[1] if len(args) > 1 else (theme_main() if theme_main() in names else main_output(on))
         if keep not in (o["name"] for o in on):
             die(tr("No monitor “{}” is on. On: {}", keep, ", ".join(o["name"] for o in on)))
         if len(on) > 1:
             SCREENS.parent.mkdir(parents=True, exist_ok=True)
             SCREENS.write_text(json.dumps(outputs(), ensure_ascii=False))
             kscreen(*(f"output.{o['name']}.disable" for o in on if o["name"] != keep))
+            time.sleep(1)
+            relayout()
         print(tr("Only {} is on", keep))
     elif args[:1] == ["all"]:
         outs = outputs()
@@ -893,15 +1014,14 @@ def cmd_screens(args):
                 if mode and n in off:
                     cmd.append(f"output.{n}.mode.{mode}")
         kscreen(*cmd)
-        # The main monitor: the current theme's, otherwise the one that was main before.
-        f = theme_dir(current()) / MAIN_OUTPUT if current() else None
-        want = f.read_text().strip() if f and f.is_file() else ""
-        if not want and saved:
-            was = [o for o in saved.values() if o.get("enabled")]
-            want = min(was, key=lambda o: o.get("priority") or 99)["name"] if was else ""
+        # The system's primary monitor as it was before; the theme's main desktop follows.
+        was = [o for o in saved.values() if o.get("enabled")]
+        want = min(was, key=lambda o: o.get("priority") or 99)["name"] if was else ""
         on = enabled_outputs()
         if want in (o["name"] for o in on) and main_output(on) != want:
             kscreen(f"output.{want}.priority.1")
+        time.sleep(1)
+        relayout()
         print(tr("Monitors on: {}", ", ".join(o["name"] for o in enabled_outputs())))
     else:
         die(tr("Usage: desk screens one [OUTPUT] | all"))
@@ -1039,6 +1159,8 @@ def main(argv):
         cmd_swap()
     elif cmd == "screens":
         cmd_screens(args)
+    elif cmd == "watch":
+        cmd_watch()
     else:
         print(__doc__.strip())
 

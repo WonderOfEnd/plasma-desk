@@ -1,0 +1,12 @@
+[Unit]
+Description=desk: keep the theme's main desktop on its monitor while monitors come and go
+After=plasma-plasmashell.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=@BINDIR@/desk watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
